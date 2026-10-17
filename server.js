@@ -13,6 +13,8 @@ const MONGO_URI=process.env.MONGO_URI||process.env.MONGODB_URI;
 if(!MONGO_URI){console.error('STARTUP STOPPED: MONGO_URI is not set. This store keeps ALL data in MongoDB Atlas and has no local-file fallback. Set MONGO_URI in Render > Environment.');process.exit(1)}
 const clone=v=>JSON.parse(JSON.stringify(v));
 const mongoose=require('mongoose');mongoose.set('strictQuery',true);
+let webpush=null;try{webpush=require('web-push')}catch(e){console.error('web-push is not installed: push notifications are disabled')}
+let pushReady=false,vapidPublic='';
 // One real MongoDB collection per data type. Every product / order / customer is its own document.
 const COLS={
 products:{model:'Product',coll:'products',key:p=>p.slug,pos:true},
@@ -20,7 +22,8 @@ categories:{model:'Category',coll:'categories',key:c=>c.slug,pos:true},
 banners:{model:'Banner',coll:'banners',key:b=>b.id,pos:true},
 orders:{model:'Order',coll:'orders',key:o=>o.id,sort:{createdAt:-1}},
 customers:{model:'Customer',coll:'customers',key:c=>c.email,sort:{createdAt:1}},
-reviews:{model:'Review',coll:'reviews',key:r=>r.id,sort:{createdAt:-1}}};
+reviews:{model:'Review',coll:'reviews',key:r=>r.id,sort:{createdAt:-1}},
+pushsubs:{model:'PushSub',coll:'pushsubs',key:p=>p.id,sort:{createdAt:1}}};
 const M={},cache={},sigs={},writes={};let writeFails=0,Meta=null,Upload=null;
 for(const[n,c]of Object.entries(COLS))M[n]=mongoose.model(c.model,new mongoose.Schema({_id:String},{strict:false,versionKey:false}),c.coll);
 const docOf=(c,x,i)=>({...x,_id:c.key(x),...(c.pos?{pos:i}:{})});
@@ -50,6 +53,11 @@ if(!list.length&&defaults[n]&&defaults[n].length&&!(await Meta.exists({_id:'seed
 else cache[n]=list}
 const st=await Meta.findById('settings').lean();cache.settings=st&&st.value?st.value:clone(defaults.settings);if(!st)await persist('settings',cache.settings);
 const MS=require('connect-mongo'),MongoStore=MS.default||MS;sessionMw=mkSession(MongoStore.create({client:mongoose.connection.getClient(),collectionName:'sessions',ttl:30*24*3600,touchAfter:24*3600}));
+if(webpush){try{const subject=process.env.VAPID_SUBJECT||process.env.PUBLIC_URL||(process.env.EMAIL_FROM?'mailto:'+process.env.EMAIL_FROM:'');
+if(!/^(https:\/\/|mailto:)/.test(subject))throw new Error('set PUBLIC_URL (the https address of your store) in Render > Environment');
+let k=process.env.VAPID_PUBLIC_KEY&&process.env.VAPID_PRIVATE_KEY?{publicKey:process.env.VAPID_PUBLIC_KEY,privateKey:process.env.VAPID_PRIVATE_KEY}:null;
+if(!k){const d=await Meta.findById('vapid').lean();if(d&&d.value&&d.value.publicKey)k=d.value;else{k=webpush.generateVAPIDKeys();await Meta.updateOne({_id:'vapid'},{$set:{value:k}},{upsert:true})}}
+webpush.setVapidDetails(subject,k.publicKey,k.privateKey);vapidPublic=k.publicKey;pushReady=true;console.log('Push notifications ready.')}catch(e){console.error('Push notifications disabled:',e.message)}}
 console.log(`MongoDB ready (db "${mongoose.connection.name}"): ${Object.keys(COLS).map(n=>n+' '+cache[n].length).join(', ')}. Nothing is stored on local disk.`)}
 for(const sig of ['SIGTERM','SIGINT'])process.on(sig,async()=>{await flushWrites();process.exit(0)});
 app.disable('x-powered-by');app.set('trust proxy',1);app.use(helmet({contentSecurityPolicy:false,crossOriginResourcePolicy:{policy:'cross-origin'}}));app.use(express.json({limit:'2mb'}));app.use(express.urlencoded({extended:true,limit:'2mb'}));
@@ -157,7 +165,7 @@ const digits=phone.replace(/\D/g,'').slice(-10);
 if(pm==='COD'&&orders.filter(o=>owns(o,req.session.customer.email)&&o.status==='Cancelled').length>=Number(st.codCancelLimit||3))return res.status(403).json({error:'COD is unavailable for this number because of cancelled orders. Please use Pay Now.'});
 const now=new Date().toISOString(),status=pm==='PAY_NOW'?'Payment Verification Pending':'Pending Confirmation';
 const order={id:'TWS-'+Date.now().toString(36).toUpperCase()+crypto.randomBytes(1).toString('hex').toUpperCase(),accountEmail:req.session.customer.email,customer,phone,email:req.session.customer.email,address,items,total:items.reduce((s,x)=>s+x.price*x.qty,0),paymentMethod:pm,utr:pm==='PAY_NOW'?utr:'',paymentStatus:pm==='PAY_NOW'?'Verification Pending':'Pay on delivery',status,history:[{status,at:now,by:'customer'}],adminNote:'',createdAt:now,cancellationReason:'',returnStatus:'Not requested'};
-orders.unshift(order);save('orders',orders);res.status(201).json({ok:true,orderId:order.id,order:publicOrder(order)})});
+orders.unshift(order);save('orders',orders);pushAll({title:'New order · ₹'+order.total,body:`${order.id} · ${order.customer} · ${order.items.reduce((n,x)=>n+x.qty,0)} item(s) · ${order.paymentMethod==='PAY_NOW'?'UPI payment (verify)':'Cash on Delivery'}`,tag:'order-'+order.id,url:'/admin/'}).catch(()=>{});res.status(201).json({ok:true,orderId:order.id,order:publicOrder(order)})});
 const THEMES=['ios-light','midnight','amber','cyber','forest','slate','iconic'];
 app.get('/api/theme',(req,res)=>{const s=db('settings');res.json({activeTheme:THEMES.includes(s.activeTheme)?s.activeTheme:'ios-light',showMarquee:s.showMarquee!==false})});
 // ---- Reviews: real, customer-written reviews only. Ratings are calculated from them. ----
@@ -176,6 +184,18 @@ const rec={id:i>=0?reviews[i].id:'RV-'+Date.now().toString(36)+crypto.randomByte
 if(i>=0)reviews[i]=rec;else reviews.unshift(rec);save('reviews',reviews);res.json({ok:true,review:pubReview(rec)})});
 app.get('/api/admin/reviews',auth,(req,res)=>res.json(db('reviews')));
 app.delete('/api/admin/reviews/:id',auth,(req,res)=>{const all=db('reviews'),next=all.filter(r=>r.id!==req.params.id);if(next.length===all.length)return res.status(404).json({error:'Review not found'});save('reviews',next);res.json({ok:true})});
+// ---- Web Push for the installed admin app ----
+const subId=ep=>crypto.createHash('sha256').update(ep).digest('hex').slice(0,32);
+async function pushAll(payload){if(!pushReady)return;const body=JSON.stringify(payload),dead=[];
+await Promise.all(db('pushsubs').map(async s=>{try{await webpush.sendNotification({endpoint:s.endpoint,keys:s.keys},body,{TTL:3600,urgency:'high'})}catch(e){if(e.statusCode===404||e.statusCode===410)dead.push(s.id);else console.error('Push failed:',e.statusCode||e.message)}}));
+if(dead.length)save('pushsubs',db('pushsubs').filter(x=>!dead.includes(x.id)))}
+app.get('/api/admin/push/key',auth,(req,res)=>pushReady?res.json({publicKey:vapidPublic}):res.status(503).json({error:'Push notifications are not available on this server'}));
+app.post('/api/admin/push/subscribe',auth,(req,res)=>{if(!pushReady)return res.status(503).json({error:'Push notifications are not available'});const sb=req.body||{},k=sb.keys||{};
+if(typeof sb.endpoint!=='string'||!/^https:\/\//.test(sb.endpoint)||sb.endpoint.length>800||typeof k.p256dh!=='string'||typeof k.auth!=='string')return res.status(400).json({error:'Invalid subscription'});
+const list=db('pushsubs'),id=subId(sb.endpoint),now=new Date().toISOString(),i=list.findIndex(x=>x.id===id),rec={id,endpoint:sb.endpoint,keys:{p256dh:k.p256dh.slice(0,200),auth:k.auth.slice(0,100)},ua:str(req.headers['user-agent'],200),createdAt:i>=0?list[i].createdAt:now,updatedAt:now};
+if(i>=0)list[i]=rec;else list.push(rec);if(list.length>20)list.splice(0,list.length-20);save('pushsubs',list);res.json({ok:true,devices:list.length});
+pushAll({title:'Order alerts are ON',body:'You will get a notification here whenever a customer places a new order.',tag:'welcome',url:'/admin/'}).catch(()=>{})});
+app.post('/api/admin/push/test',auth,async(req,res)=>{await pushAll({title:'Test notification',body:'Push notifications are working.',tag:'test',url:'/admin/'});res.json({ok:true,devices:db('pushsubs').length})});
 app.get('/api/admin/storage-status',auth,async(req,res,next)=>{try{const c=mongoose.connection,counts={};for(const n of Object.keys(COLS))counts[n]=await M[n].countDocuments();counts.uploads=await Upload.countDocuments();res.json({storage:'MongoDB Atlas',connected:c.readyState===1,database:c.name,host:c.host,documentsInDatabase:counts,failedWrites:writeFails,localFiles:'none'})}catch(e){next(e)}});
 app.post('/api/admin/upload',auth,upload.array('images',12),async(req,res,next)=>{try{const files=req.files||[];const out=[];for(const f of files){const ext=path.extname(f.originalname).toLowerCase().replace(/[^.a-z0-9]/g,''),id=Date.now()+'-'+crypto.randomBytes(5).toString('hex')+ext;await Upload.create({_id:id,mime:f.mimetype,data:f.buffer});out.push('/uploads/'+id)}res.json({files:out})}catch(e){next(e)}});
 app.get('/uploads/:name',async(req,res,next)=>{try{const d=await Upload.findById(req.params.name);if(!d)return next();res.set({'Content-Type':d.mime,'Cache-Control':'public, max-age=86400','X-Content-Type-Options':'nosniff'});res.send(Buffer.from(d.data))}catch(e){next(e)}});
